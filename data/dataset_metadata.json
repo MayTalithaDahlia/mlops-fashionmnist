@@ -1,0 +1,7 @@
+{
+  "dataset": "Fashion-MNIST",
+  "sha256": "5494a24bada208b03ce26083281279486b6c2ab468ee1ec5be9e50c4cdd8ea61",
+  "train_samples": 60000,
+  "test_samples": 10000,
+  "classes": 10
+}
