@@ -150,8 +150,17 @@ def train_model(config, epochs, seed=42, augment=False, log_model=True):
     if best_state is not None:
         model.load_state_dict(best_state)
     mlflow.log_metric("best_val_accuracy", best_val_acc)
+    
     if log_model:
-        mlflow.pytorch.log_model(model, name="model")
+        input_example = torch.randn(1, 1, 28, 28)
+
+        mlflow.pytorch.log_model(
+            model,
+            name="model",
+            input_example=input_example,
+            serialization_format="pickle"
+        )
+
     return model, best_val_acc
 
 def setup():
