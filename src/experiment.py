@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import yaml
 from pathlib import Path
 
 import mlflow
@@ -74,10 +75,52 @@ def get_data(batch_size=128, augment=False, seed=42):
 
 def data_hash():
     meta = DATA_DIR / "dataset_metadata.json"
-    if meta.exists():
-        return json.loads(meta.read_text(encoding="utf-8"))["sha256"]
-    # Fallback: hash metadata yang stabil; jalankan prepare_data.py untuk hash file sebenarnya.
-    return hashlib.sha256(b"Fashion-MNIST;train=60000;test=10000").hexdigest()
+
+    if not meta.exists():
+        raise FileNotFoundError(
+            f"Metadata dataset tidak ditemukan: {meta}. "
+            "Jalankan prepare_data.py terlebih dahulu."
+        )
+
+    metadata = json.loads(
+        meta.read_text(encoding="utf-8")
+    )
+
+    if "sha256" not in metadata:
+        raise ValueError(
+            f"Metadata dataset tidak memiliki field sha256: {meta}"
+        )
+
+    return metadata["sha256"]
+
+
+def dvc_dataset_hash():
+    dvc_file = DATA_DIR / "FashionMNIST.dvc"
+
+    if not dvc_file.exists():
+        return None
+
+    metadata = yaml.safe_load(
+        dvc_file.read_text(encoding="utf-8")
+    )
+
+    outputs = metadata.get("outs", [])
+
+    if not outputs or "md5" not in outputs[0]:
+        return None
+
+    return outputs[0]["md5"]
+
+
+def log_dataset_tags():
+    mlflow.set_tag("dataset", "Fashion-MNIST")
+
+    sha256 = data_hash()
+    mlflow.set_tag("dataset_sha256", sha256)
+
+    dvc_md5 = dvc_dataset_hash()
+    if dvc_md5:
+        mlflow.set_tag("dataset_dvc_md5", dvc_md5)
 
 class SimpleCNN(nn.Module):
     def __init__(self, dropout=0.25, channels=16):
@@ -168,12 +211,11 @@ def setup():
     mlflow.set_experiment(EXPERIMENT_NAME)
 
 def log_common(seed, config, augment):
-    mlflow.log_params({k: v for k, v in config.items()})
+    mlflow.log_params(config)
     mlflow.log_param("seed", seed)
     mlflow.log_param("device", str(DEVICE))
     mlflow.log_param("augmentation", str(augment))
-    mlflow.set_tag("dataset", "Fashion-MNIST")
-    mlflow.set_tag("dataset_sha256", data_hash())
+    log_dataset_tags()
 
 def baseline(args):
     config = {"lr": 0.001, "batch_size": 128, "dropout": 0.25, "channels": 16}
@@ -185,28 +227,64 @@ def baseline(args):
 def tune(args):
     # Parent run mewakili sweep; setiap trial menjadi nested child run.
     with mlflow.start_run(run_name="optuna-sweep"):
+        log_dataset_tags()
+
+        mlflow.set_tag("stage", "tuning-summary")
         mlflow.log_param("n_trials", args.trials)
         mlflow.log_param("epochs_per_trial", args.epochs)
+
         def objective(trial):
             config = {
-                "lr": trial.suggest_float("lr", 1e-4, 3e-3, log=True),
-                "batch_size": trial.suggest_categorical("batch_size", [64, 128]),
-                "dropout": trial.suggest_float("dropout", 0.1, 0.5),
-                "channels": trial.suggest_categorical("channels", [16, 32])
+                "lr": trial.suggest_float(
+                    "lr", 1e-4, 3e-3, log=True
+                ),
+                "batch_size": trial.suggest_categorical(
+                    "batch_size", [64, 128]
+                ),
+                "dropout": trial.suggest_float(
+                    "dropout", 0.1, 0.5
+                ),
+                "channels": trial.suggest_categorical(
+                    "channels", [16, 32]
+                ),
             }
-            with mlflow.start_run(run_name=f"trial-{trial.number:02d}", nested=True):
+
+            with mlflow.start_run(
+                run_name=f"trial-{trial.number:02d}",
+                nested=True,
+            ):
                 log_common(42, config, False)
                 mlflow.set_tag("stage", "tuning")
                 mlflow.log_param("trial_number", trial.number)
-                _, score = train_model(config, args.epochs, seed=42, augment=False)
+
+                _, score = train_model(
+                    config,
+                    args.epochs,
+                    seed=42,
+                    augment=False,
+                )
+
                 mlflow.log_metric("objective_val_accuracy", score)
                 return score
-        study = optuna.create_study(direction="maximize",
-                                    sampler=optuna.samplers.TPESampler(seed=42))
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+
         study.optimize(objective, n_trials=args.trials)
-        CONFIG_PATH.write_text(json.dumps(study.best_params, indent=2), encoding="utf-8")
+
+        CONFIG_PATH.write_text(
+            json.dumps(study.best_params, indent=2),
+            encoding="utf-8",
+        )
+
         mlflow.log_dict(study.best_params, "best_config.json")
-        mlflow.log_metric("best_trial_val_accuracy", study.best_value)
+        mlflow.log_metric(
+            "best_trial_val_accuracy",
+            study.best_value,
+        )
+
         print("Konfigurasi terbaik:", study.best_params)
         print("Akurasi validasi terbaik:", study.best_value)
         print("Disimpan ke", CONFIG_PATH)
@@ -227,12 +305,22 @@ def evaluate_seeds(args):
             scores.append(score)
     mean, std = float(np.mean(scores)), float(np.std(scores, ddof=1))
     with mlflow.start_run(run_name="three-seed-summary"):
+        log_dataset_tags()
+
+        mlflow.set_tag("stage", "multi-seed-summary")
         mlflow.log_params(config)
         mlflow.log_metric("val_accuracy_mean", mean)
         mlflow.log_metric("val_accuracy_std", std)
-        mlflow.log_dict({"seeds": [42, 123, 2026], "scores": scores,
-                         "mean": mean, "std_sample": std},
-                        "three_seed_results.json")
+
+        mlflow.log_dict(
+            {
+                "seeds": [42, 123, 2026],
+                "scores": scores,
+                "mean": mean,
+                "std_sample": std,
+            },
+            "three_seed_results.json",
+    )
     print("Skor per seed:", scores)
     print(f"Mean akurasi validasi = {mean:.4f}")
     print(f"Standar deviasi sampel = {std:.4f}")
@@ -255,8 +343,10 @@ def ablation(args):
             mlflow.log_metric("ablation_val_accuracy", score)
             print(name, "validation accuracy:", round(score, 4))
 
+
 def register(args):
     client = MlflowClient(tracking_uri=TRACKING_URI)
+
     # Pilih run tuning dengan nilai objective validasi tertinggi.
     runs = mlflow.search_runs(
         experiment_names=[EXPERIMENT_NAME],
@@ -264,36 +354,123 @@ def register(args):
         order_by=["metrics.objective_val_accuracy DESC"],
         max_results=1
     )
+
     if runs.empty:
-        raise RuntimeError("Run tuning tidak ditemukan. Jalankan mode tune dahulu.")
+        raise RuntimeError(
+            "Run tuning tidak ditemukan. Jalankan mode tune dahulu."
+        )
+
     run_id = runs.iloc[0]["run_id"]
     model_uri = f"runs:/{run_id}/model"
     registered = mlflow.register_model(model_uri, MODEL_NAME)
-    client.set_registered_model_alias(MODEL_NAME, "champion", registered.version)
-    loaded = mlflow.pytorch.load_model(f"models:/{MODEL_NAME}@champion")
-    _, _, test_loader = get_data(batch_size=128, augment=False, seed=42)
+
+    client.set_registered_model_alias(
+        MODEL_NAME, "champion", registered.version
+    )
+
+    loaded = mlflow.pytorch.load_model(
+        f"models:/{MODEL_NAME}@champion"
+    )
+
+    _, _, test_loader = get_data(
+        batch_size=128, augment=False, seed=42
+    )
+
     loaded.to(DEVICE)
-    test_loss, test_acc = run_epoch(loaded, test_loader, nn.CrossEntropyLoss())
-    with mlflow.start_run(run_name="champion-test-evaluation"):
-        mlflow.log_param("source_run_id", run_id)
-        mlflow.log_param("registered_model_version", registered.version)
-        mlflow.log_metric("test_loss", test_loss)
-        mlflow.log_metric("test_accuracy", test_acc)
-        mlflow.set_tag("model_alias", "champion")
-        mlflow.set_tag("dataset_sha256", data_hash())
+    test_loss, test_acc = run_epoch(
+        loaded, test_loader, nn.CrossEntropyLoss()
+    )
+
+    # Membuat contoh prediksi menggunakan input dummy.
     sample = torch.randn(2, 1, 28, 28).to(DEVICE)
     loaded.eval()
+
     with torch.no_grad():
         predictions = loaded(sample).argmax(dim=1).cpu().tolist()
+
+    with mlflow.start_run(run_name="champion-test-evaluation"):
+        log_dataset_tags()
+
+        mlflow.log_param("source_run_id", run_id)
+        mlflow.log_param(
+            "registered_model_version", registered.version
+        )
+
+        mlflow.log_metric("test_loss", float(test_loss))
+        mlflow.log_metric("test_accuracy", float(test_acc))
+
+        # Menyimpan hasil evaluasi sebagai artefak.
+        mlflow.log_dict(
+            {
+                "model_name": MODEL_NAME,
+                "model_version": registered.version,
+                "model_alias": "champion",
+                "test_loss": float(test_loss),
+                "test_accuracy": float(test_acc),
+                "sample_prediction": predictions,
+            },
+            "evaluation_results.json",
+        )
+
+        mlflow.set_tag("model_alias", "champion")
+        mlflow.set_tag("stage", "test-evaluation")
+
     print("Model terdaftar:", MODEL_NAME, "versi", registered.version)
     print("Alias: @champion")
     print("Test accuracy:", round(test_acc, 4))
     print("Contoh prediksi kelas (input dummy):", predictions)
 
+
+def evaluate_champion(args):
+    loaded = mlflow.pytorch.load_model(
+        f"models:/{MODEL_NAME}@champion"
+    )
+
+    loaded.to(DEVICE)
+
+    _, _, test_loader = get_data(
+        batch_size=128,
+        augment=False,
+        seed=42
+    )
+
+    test_loss, test_acc = run_epoch(
+        loaded,
+        test_loader,
+        nn.CrossEntropyLoss()
+    )
+
+    with mlflow.start_run(
+        run_name="champion-test-evaluation-artifact"
+    ):
+        log_dataset_tags()
+
+        mlflow.log_metric("test_loss", float(test_loss))
+        mlflow.log_metric("test_accuracy", float(test_acc))
+
+        mlflow.log_dict(
+            {
+                "model_name": MODEL_NAME,
+                "model_alias": "champion",
+                "test_loss": float(test_loss),
+                "test_accuracy": float(test_acc),
+            },
+            "evaluation_results.json"
+        )
+
+    print("Test accuracy:", round(test_acc, 4))
+    print("Hasil evaluasi berhasil dicatat.")
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["baseline", "tune", "seeds", "ablation", "register"],
-                        required=True)
+    parser.add_argument(
+    "--mode",
+    choices=[
+        "baseline", "tune", "seeds",
+        "ablation", "register", "evaluate"
+    ],
+    required=True
+)
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=2)
     args = parser.parse_args()
@@ -310,6 +487,8 @@ def main():
         ablation(args)
     elif args.mode == "register":
         register(args)
+    elif args.mode == "evaluate":
+        evaluate_champion(args)
 
 if __name__ == "__main__":
     main()
